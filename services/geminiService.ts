@@ -6,11 +6,12 @@
 import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
 
 // Helper to get the API key from the appropriate source.
-// To ensure functionality on hosting platforms like Netlify,
-// we exclusively rely on the API key stored in localStorage.
-// This avoids "process is not defined" errors in browser-only environments.
-const getApiKey = (): string | null => {
-  return localStorage.getItem('gemini-api-key');
+// As per user request, the API key is now hardcoded.
+// WARNING: Hardcoding API keys in client-side code is a major security risk.
+// This key will be visible to anyone inspecting the website's source code.
+// This is implemented based on a specific user request and is NOT recommended for production.
+const getApiKey = (): string => {
+  return "AIzaSyDdVMVSj5ZFGtpm9gJ2GATOp-sjwqIBfA4";
 }
 
 

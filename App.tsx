@@ -14,7 +14,6 @@ import AdjustmentPanel from './components/AdjustmentPanel';
 import CropPanel from './components/CropPanel';
 import { UndoIcon, RedoIcon, EyeIcon } from './components/icons';
 import StartScreen from './components/StartScreen';
-import ApiKeyScreen from './components/ApiKeyScreen';
 
 // Helper to convert a data URL string to a File object
 const dataURLtoFile = (dataurl: string, filename: string): File => {
@@ -35,23 +34,7 @@ const dataURLtoFile = (dataurl: string, filename: string): File => {
 
 type Tab = 'retouch' | 'adjust' | 'filters' | 'crop';
 
-declare global {
-  // Fix: Moved AIStudio interface inside `declare global` to resolve declaration errors.
-  // This ensures it correctly augments the global Window type without scope conflicts.
-  interface AIStudio {
-    hasSelectedApiKey: () => Promise<boolean>;
-    openSelectKey: () => Promise<void>;
-  }
-  interface Window {
-    // Fix: Made `aistudio` optional to match other declarations and reflect that it's only present in specific environments.
-    aistudio?: AIStudio;
-  }
-}
-
 const App: React.FC = () => {
-  const [hasApiKey, setHasApiKey] = useState<boolean>(false);
-  const [isCheckingApiKey, setIsCheckingApiKey] = useState<boolean>(true);
-  
   const [history, setHistory] = useState<File[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
   const [prompt, setPrompt] = useState<string>('');
@@ -66,48 +49,6 @@ const App: React.FC = () => {
   const [aspect, setAspect] = useState<number | undefined>();
   const [isComparing, setIsComparing] = useState<boolean>(false);
   const imgRef = useRef<HTMLImageElement>(null);
-
-  useEffect(() => {
-    const checkApiKey = async () => {
-      setIsCheckingApiKey(true);
-      try {
-        if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
-          const keyStatus = await window.aistudio.hasSelectedApiKey();
-          setHasApiKey(keyStatus);
-        } else {
-          const storedKey = localStorage.getItem('gemini-api-key');
-          setHasApiKey(!!storedKey);
-        }
-      } catch (e) {
-        console.error("Error checking for API key:", e);
-        setHasApiKey(false);
-      } finally {
-        setIsCheckingApiKey(false);
-      }
-    };
-    checkApiKey();
-  }, []);
-
-  const handleSelectKey = useCallback(async () => {
-    try {
-      if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
-        await window.aistudio.openSelectKey();
-        setHasApiKey(true);
-      } else {
-        setError("API key selection feature is not available in this environment.");
-      }
-    } catch (e) {
-      console.error("Error opening select key dialog:", e);
-      setError("Could not open the API key selection dialog.");
-    }
-  }, []);
-
-  const handleSaveKey = useCallback((key: string) => {
-    localStorage.setItem('gemini-api-key', key);
-    setHasApiKey(true);
-    setError(null);
-  }, []);
-
 
   const currentImage = history[historyIndex] ?? null;
   const originalImage = history[0] ?? null;
@@ -161,14 +102,21 @@ const App: React.FC = () => {
 
   const handleApiError = (err: unknown, context: string) => {
     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-    if (errorMessage.includes("API key not valid") || errorMessage.includes("permission") || errorMessage.includes("not found") || errorMessage.includes("API key not found")) {
-        setError("Your API key may be invalid or lack necessary permissions. Please provide a valid key and try again.");
-        localStorage.removeItem('gemini-api-key');
-        setHasApiKey(false);
-    } else {
-        setError(`Failed to ${context}. ${errorMessage}`);
-    }
     console.error(err);
+
+    // Check for common API key-related error messages from Google's services
+    const lowerCaseError = errorMessage.toLowerCase();
+    if (lowerCaseError.includes('api key not valid') || 
+        lowerCaseError.includes('permission denied') ||
+        lowerCaseError.includes('quota') ||
+        lowerCaseError.includes('403 forbidden') || // Explicit check for permission errors
+        lowerCaseError.includes('api_key_invalid') ||
+        lowerCaseError.includes('request had invalid authentication credentials')) {
+        setError(`Failed to ${context}. The API call was rejected by Google. This is almost always due to API key restrictions (like domain/IP limits) or billing issues, not a problem with the app's code. 
+        Please check your Google AI/Cloud console to ensure your key is valid, has billing enabled, and has no HTTP referrer restrictions preventing it from being used on this website's domain. Original Error: ${errorMessage}`);
+    } else {
+        setError(`Failed to ${context}. Please check your network connection and the server status. Error: ${errorMessage}`);
+    }
   };
 
   const handleGenerate = useCallback(async () => {
@@ -532,7 +480,7 @@ const App: React.FC = () => {
       return (
         <div className="text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4">
           <h2 className="text-2xl font-bold text-red-300">An Error Occurred</h2>
-          <p className="text-md text-red-400">{error}</p>
+          <p className="text-md text-red-400 whitespace-pre-wrap">{error}</p>
           <button
               onClick={() => setError(null)}
               className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors"
@@ -543,21 +491,13 @@ const App: React.FC = () => {
       );
     }
     
-    if (isCheckingApiKey) {
-      return <Spinner />;
-    }
-
-    if (hasApiKey) {
-      return renderContent();
-    }
-
-    return <ApiKeyScreen onSelectKey={handleSelectKey} onSaveKey={handleSaveKey} />;
+    return renderContent();
   }
   
   return (
     <div className="min-h-screen text-gray-100 flex flex-col">
       <Header />
-      <main className={`flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center ${hasApiKey && currentImage ? 'items-start' : 'items-center'}`}>
+      <main className={`flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center ${currentImage ? 'items-start' : 'items-center'}`}>
         {renderMainContent()}
       </main>
     </div>
