@@ -37,12 +37,13 @@ type Tab = 'retouch' | 'adjust' | 'filters' | 'crop';
 
 // Fix: Define a named interface `AIStudio` and use it for `window.aistudio`.
 // This resolves the TypeScript error about subsequent property declarations needing to have the same type.
-interface AIStudio {
-  hasSelectedApiKey: () => Promise<boolean>;
-  openSelectKey: () => Promise<void>;
-}
-
+// The AIStudio interface is moved inside `declare global` to make it a global type.
 declare global {
+  interface AIStudio {
+    hasSelectedApiKey: () => Promise<boolean>;
+    openSelectKey: () => Promise<void>;
+  }
+
   interface Window {
     aistudio: AIStudio;
   }
@@ -342,21 +343,6 @@ const App: React.FC = () => {
 };
 
   const renderContent = () => {
-    if (error) {
-       return (
-           <div className="text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4">
-            <h2 className="text-2xl font-bold text-red-300">An Error Occurred</h2>
-            <p className="text-md text-red-400">{error}</p>
-            <button
-                onClick={() => setError(null)}
-                className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors"
-              >
-                Try Again
-            </button>
-          </div>
-        );
-    }
-    
     if (!currentImageUrl) {
       return <StartScreen onFileSelect={handleFileSelect} />;
     }
@@ -537,7 +523,18 @@ const App: React.FC = () => {
     <div className="min-h-screen text-gray-100 flex flex-col">
       <Header />
       <main className={`flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center ${hasApiKey && currentImage ? 'items-start' : 'items-center'}`}>
-        {isCheckingApiKey ? (
+        {error ? (
+           <div className="text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4">
+            <h2 className="text-2xl font-bold text-red-300">An Error Occurred</h2>
+            <p className="text-md text-red-400">{error}</p>
+            <button
+                onClick={() => setError(null)}
+                className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors"
+              >
+                Try Again
+            </button>
+          </div>
+        ) : isCheckingApiKey ? (
           <Spinner />
         ) : hasApiKey ? (
           renderContent()
