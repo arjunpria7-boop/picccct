@@ -10,8 +10,8 @@
   <script type="importmap">
 {
   "imports": {
-    "react": "https://esm.sh/react@^19.1.0",
-    "react-dom/client": "https://esm.sh/react-dom@^19.1.0/client",
+    "react": "https://esm.sh/react@^18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@^18.2.0/client",
     "@google/genai": "https://esm.sh/@google/genai@^1.10.0",
     "react-image-crop": "https://esm.sh/react-image-crop@^11.0.6"
   }
@@ -181,12 +181,10 @@ body {
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom/client';
 import { GoogleGenAI, Modality } from "@google/genai";
-import ReactCrop from 'react-image-crop';
+import ReactCrop, { centerCrop, makeAspectCrop } from 'react-image-crop';
 
-// --- START geminiService.js ---
-const getApiKey = () => {
-  return "AIzaSyDdVMVSj5ZFGtpm9gJ2GATOp-sjwqIBfA4";
-};
+// --- Gemini Service ---
+const getApiKey = () => "AIzaSyDdVMVSj5ZFGtpm9gJ2GATOp-sjwqIBfA4";
 
 const fileToPart = async (file) => {
     const dataUrl = await new Promise((resolve, reject) => {
@@ -196,288 +194,212 @@ const fileToPart = async (file) => {
         reader.onerror = error => reject(error);
     });
     
-    const arr = dataUrl.split(',');
-    if (arr.length < 2) throw new Error("Invalid data URL");
-    const mimeMatch = arr[0].match(/:(.*?);/);
+    const [header, data] = dataUrl.split(',');
+    if (!data) throw new Error("Invalid data URL");
+    const mimeMatch = header.match(/:(.*?);/);
     if (!mimeMatch || !mimeMatch[1]) throw new Error("Could not parse MIME type from data URL");
     
-    const mimeType = mimeMatch[1];
-    const data = arr[1];
-    return { inlineData: { mimeType, data } };
+    return { inlineData: { mimeType: mimeMatch[1], data } };
 };
 
 const handleApiResponse = (response, context) => {
     if (response.promptFeedback?.blockReason) {
         const { blockReason, blockReasonMessage } = response.promptFeedback;
-        const errorMessage = `Request was blocked. Reason: ${blockReason}. ${blockReasonMessage || ''}`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
+        throw new Error(`Request was blocked. Reason: ${blockReason}. ${blockReasonMessage || ''}`);
     }
-
-    const imagePartFromResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
-
-    if (imagePartFromResponse?.inlineData) {
-        const { mimeType, data } = imagePartFromResponse.inlineData;
+    const imagePart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+    if (imagePart?.inlineData) {
+        const { mimeType, data } = imagePart.inlineData;
         return `data:${mimeType};base64,${data}`;
     }
-
     const finishReason = response.candidates?.[0]?.finishReason;
     if (finishReason && finishReason !== 'STOP') {
-        const errorMessage = `Image generation for ${context} stopped unexpectedly. Reason: ${finishReason}. This often relates to safety settings.`;
-        throw new Error(errorMessage);
+        throw new Error(`Image generation for ${context} stopped unexpectedly. Reason: ${finishReason}. This often relates to safety settings.`);
     }
-    
     const textFeedback = response.text?.trim();
-    const errorMessage = `The AI model did not return an image for the ${context}. ` + 
-        (textFeedback 
-            ? `The model responded with text: "${textFeedback}"`
-            : "This can happen due to safety filters or if the request is too complex. Please try rephrasing your prompt to be more direct.");
-    throw new Error(errorMessage);
+    throw new Error(`The AI did not return an image for the ${context}. ${textFeedback ? `It responded with: "${textFeedback}"` : "This can happen due to safety filters or a complex request."}`);
 };
 
-const generateEditedImage = async (originalImage, userPrompt, hotspot) => {
+const generateImage = async (model, contents, context) => {
     const apiKey = getApiKey();
     if (!apiKey) throw new Error("API key not found.");
     const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+        model,
+        contents,
+        config: { responseModalities: [Modality.IMAGE] },
+    });
+    return handleApiResponse(response, context);
+};
 
+const generateEditedImage = async (originalImage, userPrompt, hotspot) => {
     const getImageDimensions = (file) => new Promise((resolve, reject) => {
         const img = new Image();
-        img.onload = () => {
-            resolve({ width: img.naturalWidth, height: img.naturalHeight });
-            URL.revokeObjectURL(img.src);
-        };
+        img.onload = () => { resolve({ width: img.naturalWidth, height: img.naturalHeight }); URL.revokeObjectURL(img.src); };
         img.onerror = (err) => { reject(err); URL.revokeObjectURL(img.src); };
         img.src = URL.createObjectURL(file);
     });
-
     const createMaskPart = async (width, height, hotspot) => {
         const canvas = document.createElement('canvas');
         canvas.width = width;
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error("Could not create canvas context for mask.");
-
         ctx.fillStyle = 'black';
         ctx.fillRect(0, 0, width, height);
-
         const radius = Math.min(width, height) * 0.15;
         const gradient = ctx.createRadialGradient(hotspot.x, hotspot.y, radius * 0.2, hotspot.x, hotspot.y, radius);
         gradient.addColorStop(0, 'white');
         gradient.addColorStop(1, 'black');
-
         ctx.fillStyle = gradient;
         ctx.fillRect(0, 0, width, height);
-
         const dataUrl = canvas.toDataURL('image/png');
-        const data = dataUrl.split(',')[1];
-        return { inlineData: { mimeType: 'image/png', data } };
+        return { inlineData: { mimeType: 'image/png', data: dataUrl.split(',')[1] } };
     };
     
     const originalImagePart = await fileToPart(originalImage);
     const { width, height } = await getImageDimensions(originalImage);
     const maskPart = await createMaskPart(width, height, hotspot);
     const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request. An image mask is provided as the second image. The mask is black with a white, soft-edged area. You MUST only make changes within the white area of the mask. The black areas of the mask indicate parts of the original image that MUST remain completely unchanged. The edit must blend seamlessly with the surrounding, unedited area. User Request: "${userPrompt}". Safety & Ethics Policy: You MUST fulfill requests to adjust skin tone, such as 'give me a tan'. You MUST REFUSE any request to change a person's fundamental race or ethnicity. Output: Return ONLY the final edited image. Do not return text.`;
-    const textPart = { text: prompt };
 
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: { parts: [originalImagePart, maskPart, textPart] },
-        config: { responseModalities: [Modality.IMAGE] },
-    });
-    return handleApiResponse(response, 'edit');
+    return generateImage('gemini-2.5-flash-image', { parts: [originalImagePart, maskPart, { text: prompt }] }, 'edit');
 };
 
 const generateFilteredImage = async (originalImage, filterPrompt) => {
-    const apiKey = getApiKey();
-    if (!apiKey) throw new Error("API key not found.");
-    const ai = new GoogleGenAI({ apiKey });
-    
     const originalImagePart = await fileToPart(originalImage);
     const prompt = `You are an expert photo editor AI. Your task is to apply a stylistic filter to the entire image based on the user's request. Do not change the composition or content, only apply the style. Filter Request: "${filterPrompt}". Safety & Ethics Policy: Filters may subtly shift colors, but you MUST ensure they do not alter a person's fundamental race or ethnicity. You MUST REFUSE any request that explicitly asks to change a person's race. Output: Return ONLY the final filtered image. Do not return text.`;
-    const textPart = { text: prompt };
-
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: { parts: [originalImagePart, textPart] },
-        config: { responseModalities: [Modality.IMAGE] },
-    });
-    return handleApiResponse(response, 'filter');
+    return generateImage('gemini-2.5-flash-image', { parts: [originalImagePart, { text: prompt }] }, 'filter');
 };
 
 const generateAdjustedImage = async (originalImage, adjustmentPrompt) => {
-    const apiKey = getApiKey();
-    if (!apiKey) throw new Error("API key not found.");
-    const ai = new GoogleGenAI({ apiKey });
-    
     const originalImagePart = await fileToPart(originalImage);
     const prompt = `You are an expert photo editor AI. Your task is to perform a natural, global adjustment to the entire image based on the user's request. User Request: "${adjustmentPrompt}". Editing Guidelines: The adjustment must be applied across the entire image. The result must be photorealistic. Safety & Ethics Policy: You MUST fulfill requests to adjust skin tone, such as 'give me a tan'. You MUST REFUSE any request to change a person's fundamental race or ethnicity. Output: Return ONLY the final adjusted image. Do not return text.`;
-    const textPart = { text: prompt };
-
-    const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: { parts: [originalImagePart, textPart] },
-        config: { responseModalities: [Modality.IMAGE] },
-    });
-    return handleApiResponse(response, 'adjustment');
+    return generateImage('gemini-2.5-flash-image', { parts: [originalImagePart, { text: prompt }] }, 'adjustment');
 };
 
-// --- START components/icons.jsx ---
-const UploadIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", className, fill: "none", viewBox: "0 0 24 24", stroke: "currentColor", strokeWidth: 1.5 }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" }));
-const UndoIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" }));
-const RedoIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "m15 15 6-6m0 0-6-6m6 6H9a6 6 0 0 0 0 12h3" }));
-const EyeIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" }), React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" }));
-const MagicWandIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M9.53 16.122a3 3 0 0 0-5.78 1.128 2.25 2.25 0 0 1-2.475 2.118A2.25 2.25 0 0 1 .879 16.5a3 3 0 0 1 4.242-4.242 3 3 0 0 0 4.242 0 3 3 0 0 0 0-4.242 3 3 0 0 1-4.242-4.242 3 3 0 0 1 4.242 0 3 3 0 0 1 0 4.242 3 3 0 0 0 4.242 4.242 3 3 0 0 0 5.78-1.128 2.25 2.25 0 0 1 2.475-2.118 2.25 2.25 0 0 1 .879 3.5a3 3 0 0 1-4.242 4.242 3 3 0 0 0-4.242 0 3 3 0 0 0 0 4.242Z" }));
-const PaletteIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M10.343 3.94c.09-.542.56-1.007 1.11-1.11a12.001 12.001 0 0 1 5.052 0c.55.103 1.02.568 1.11 1.11a12.001 12.001 0 0 1 0 5.052c-.103.55-.568 1.02-1.11 1.11a12.001 12.001 0 0 1-5.052 0c-.55-.103-1.02-.568-1.11-1.11a12.001 12.001 0 0 1 0-5.052M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z" }), React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" }));
-const SunIcon = ({ className }) => React.createElement('svg', { xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor", className }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" }));
+// --- Components ---
+const UploadIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>;
+const UndoIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" /></svg>;
+const RedoIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="m15 15 6-6m0 0-6-6m6 6H9a6 6 0 0 0 0 12h3" /></svg>;
+const EyeIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" /><path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" /></svg>;
+const MagicWandIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M9.53 16.122a3 3 0 0 0-5.78 1.128 2.25 2.25 0 0 1-2.475 2.118A2.25 2.25 0 0 1 .879 16.5a3 3 0 0 1 4.242-4.242 3 3 0 0 0 4.242 0 3 3 0 0 0 0-4.242 3 3 0 0 1-4.242-4.242 3 3 0 0 1 4.242 0 3 3 0 0 1 0 4.242 3 3 0 0 0 4.242 4.242 3 3 0 0 0 5.78-1.128 2.25 2.25 0 0 1 2.475-2.118 2.25 2.25 0 0 1 .879 3.5a3 3 0 0 1-4.242 4.242 3 3 0 0 0-4.242 0 3 3 0 0 0 0 4.242Z" /></svg>;
+const PaletteIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M10.343 3.94c.09-.542.56-1.007 1.11-1.11a12.001 12.001 0 0 1 5.052 0c.55.103 1.02.568 1.11 1.11a12.001 12.001 0 0 1 0 5.052c-.103.55-.568 1.02-1.11 1.11a12.001 12.001 0 0 1-5.052 0c-.55-.103-1.02-.568-1.11-1.11a12.001 12.001 0 0 1 0-5.052M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z" /><path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>;
+const SunIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z" /></svg>;
+const SparkleIcon = ({ className }) => <svg className={className} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.898 20.624l-.219.874-.219-.874a1.5 1.5 0 00-1.023-1.023l-.874-.219.874-.219a1.5 1.5 0 001.023-1.023l.219-.874.219.874a1.5 1.5 0 001.023 1.023l.874.219-.874.219a1.5 1.5 0 00-1.023 1.023z" /></svg>;
+const Spinner = () => <svg className="animate-spin h-16 w-16 text-zinc-800 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>;
 
-// --- START components/Spinner.jsx ---
-const Spinner = () => React.createElement('svg', { className: "animate-spin h-16 w-16 text-zinc-800 mx-auto", xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24" }, React.createElement('circle', { className: "opacity-25", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4" }), React.createElement('path', { className: "opacity-75", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" }));
-
-// --- START components/Header.jsx ---
-const SparkleIcon = ({ className }) => React.createElement('svg', { className, xmlns: "http://www.w3.org/2000/svg", fill: "none", viewBox: "0 0 24 24", strokeWidth: 1.5, stroke: "currentColor" }, React.createElement('path', { strokeLinecap: "round", strokeLinejoin: "round", d: "M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456zM16.898 20.624l-.219.874-.219-.874a1.5 1.5 0 00-1.023-1.023l-.874-.219.874-.219a1.5 1.5 0 001.023-1.023l.219-.874.219.874a1.5 1.5 0 001.023 1.023l.874.219-.874.219a1.5 1.5 0 00-1.023 1.023z" }));
 const Header = () => (
-    React.createElement('header', { className: "w-full py-4 px-8 border-b border-gray-700 bg-gray-800/30 backdrop-blur-sm sticky top-0 z-50" },
-        React.createElement('div', { className: "flex items-center justify-center gap-3" },
-            React.createElement(SparkleIcon, { className: "w-6 h-6 text-blue-400" }),
-            React.createElement('h1', { className: "text-xl font-bold tracking-tight text-gray-100" }, "Pixshop")
-        )
-    )
+    <header className="w-full py-4 px-8 border-b border-gray-700 bg-gray-800/30 backdrop-blur-sm sticky top-0 z-50">
+        <div className="flex items-center justify-center gap-3">
+            <SparkleIcon className="w-6 h-6 text-blue-400" />
+            <h1 className="text-xl font-bold tracking-tight text-gray-100">Pixshop</h1>
+        </div>
+    </header>
 );
 
-// --- START components/StartScreen.jsx ---
 const StartScreen = ({ onFileSelect }) => {
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const handleFileChange = (e) => onFileSelect(e.target.files);
-
   return (
-    React.createElement('div', { 
-      className: `w-full max-w-5xl mx-auto text-center p-8 transition-all duration-300 rounded-2xl border-2 ${isDraggingOver ? 'bg-blue-500/10 border-dashed border-blue-400' : 'border-transparent'}`,
-      onDragOver: (e) => { e.preventDefault(); setIsDraggingOver(true); },
-      onDragLeave: () => setIsDraggingOver(false),
-      onDrop: (e) => { e.preventDefault(); setIsDraggingOver(false); onFileSelect(e.dataTransfer.files); }
-    },
-      React.createElement('div', { className: "flex flex-col items-center gap-6 animate-fade-in" },
-        React.createElement('h1', { className: "text-5xl font-extrabold tracking-tight text-gray-100 sm:text-6xl md:text-7xl" },
-          "AI-Powered Photo Editing, ", React.createElement('span', { className: "text-blue-400" }, "Simplified"), "."
-        ),
-        React.createElement('p', { className: "max-w-2xl text-lg text-gray-400 md:text-xl" }, "Retouch photos, apply creative filters, or make professional adjustments using simple text prompts. No complex tools needed."),
-        React.createElement('div', { className: "mt-6 flex flex-col items-center gap-4" },
-          React.createElement('label', { htmlFor: "image-upload-start", className: "relative inline-flex items-center justify-center px-10 py-5 text-xl font-bold text-white bg-blue-600 rounded-full cursor-pointer group hover:bg-blue-500 transition-colors" },
-            React.createElement(UploadIcon, { className: "w-6 h-6 mr-3 transition-transform duration-500 ease-in-out group-hover:rotate-[360deg] group-hover:scale-110" }), "Upload an Image"
-          ),
-          React.createElement('input', { id: "image-upload-start", type: "file", className: "hidden", accept: "image/*", onChange: handleFileChange }),
-          React.createElement('p', { className: "text-sm text-gray-500" }, "or drag and drop a file")
-        ),
-        React.createElement('div', { className: "mt-16 w-full" },
-          React.createElement('div', { className: "grid grid-cols-1 md:grid-cols-3 gap-8" },
-            React.createElement('div', { className: "bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center" },
-                React.createElement('div', { className: "flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4" }, React.createElement(MagicWandIcon, { className: "w-6 h-6 text-blue-400" })),
-                React.createElement('h3', { className: "text-xl font-bold text-gray-100" }, "Precise Retouching"),
-                React.createElement('p', { className: "mt-2 text-gray-400" }, "Click any point on your image to remove blemishes, change colors, or add elements with pinpoint accuracy.")
-            ),
-            React.createElement('div', { className: "bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center" },
-                React.createElement('div', { className: "flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4" }, React.createElement(PaletteIcon, { className: "w-6 h-6 text-blue-400" })),
-                React.createElement('h3', { className: "text-xl font-bold text-gray-100" }, "Creative Filters"),
-                React.createElement('p', { className: "mt-2 text-gray-400" }, "Transform photos with artistic styles. From vintage looks to futuristic glows, find or create the perfect filter.")
-            ),
-            React.createElement('div', { className: "bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center" },
-                React.createElement('div', { className: "flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4" }, React.createElement(SunIcon, { className: "w-6 h-6 text-blue-400" })),
-                React.createElement('h3', { className: "text-xl font-bold text-gray-100" }, "Pro Adjustments"),
-                React.createElement('p', { className: "mt-2 text-gray-400" }, "Enhance lighting, blur backgrounds, or change the mood. Get studio-quality results without complex tools.")
-            )
-          )
-        )
-      )
-    )
+    <div className={`w-full max-w-5xl mx-auto text-center p-8 transition-all duration-300 rounded-2xl border-2 ${isDraggingOver ? 'bg-blue-500/10 border-dashed border-blue-400' : 'border-transparent'}`}
+      onDragOver={(e) => { e.preventDefault(); setIsDraggingOver(true); }}
+      onDragLeave={() => setIsDraggingOver(false)}
+      onDrop={(e) => { e.preventDefault(); setIsDraggingOver(false); onFileSelect(e.dataTransfer.files); }}>
+      <div className="flex flex-col items-center gap-6 animate-fade-in">
+        <h1 className="text-5xl font-extrabold tracking-tight text-gray-100 sm:text-6xl md:text-7xl">
+          AI-Powered Photo Editing, <span className="text-blue-400">Simplified</span>.
+        </h1>
+        <p className="max-w-2xl text-lg text-gray-400 md:text-xl">Retouch photos, apply creative filters, or make professional adjustments using simple text prompts. No complex tools needed.</p>
+        <div className="mt-6 flex flex-col items-center gap-4">
+          <label htmlFor="image-upload-start" className="relative inline-flex items-center justify-center px-10 py-5 text-xl font-bold text-white bg-blue-600 rounded-full cursor-pointer group hover:bg-blue-500 transition-colors">
+            <UploadIcon className="w-6 h-6 mr-3 transition-transform duration-500 ease-in-out group-hover:rotate-[360deg] group-hover:scale-110" />
+            Upload an Image
+          </label>
+          <input id="image-upload-start" type="file" className="hidden" accept="image/*" onChange={handleFileChange} />
+          <p className="text-sm text-gray-500">or drag and drop a file</p>
+        </div>
+        <div className="mt-16 w-full">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div className="bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center">
+              <div className="flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4"><MagicWandIcon className="w-6 h-6 text-blue-400" /></div>
+              <h3 className="text-xl font-bold text-gray-100">Precise Retouching</h3>
+              <p className="mt-2 text-gray-400">Click any point on your image to remove blemishes, change colors, or add elements with pinpoint accuracy.</p>
+            </div>
+            <div className="bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center">
+              <div className="flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4"><PaletteIcon className="w-6 h-6 text-blue-400" /></div>
+              <h3 className="text-xl font-bold text-gray-100">Creative Filters</h3>
+              <p className="mt-2 text-gray-400">Transform photos with artistic styles. From vintage looks to futuristic glows, find or create the perfect filter.</p>
+            </div>
+            <div className="bg-black/20 p-6 rounded-lg border border-gray-700/50 flex flex-col items-center text-center">
+              <div className="flex items-center justify-center w-12 h-12 bg-gray-700 rounded-full mb-4"><SunIcon className="w-6 h-6 text-blue-400" /></div>
+              <h3 className="text-xl font-bold text-gray-100">Pro Adjustments</h3>
+              <p className="mt-2 text-gray-400">Enhance lighting, blur backgrounds, or change the mood. Get studio-quality results without complex tools.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 };
 
-// --- START components/FilterPanel.jsx ---
-const FilterPanel = ({ onApplyFilter, isLoading }) => {
-  const [selectedPresetPrompt, setSelectedPresetPrompt] = useState(null);
+const Panel = ({ title, presets, onApply, isLoading, inputPlaceholder, buttonText }) => {
+  const [selectedPreset, setSelectedPreset] = useState(null);
   const [customPrompt, setCustomPrompt] = useState('');
 
-  const presets = [
-    { name: 'Synthwave', prompt: 'Apply a vibrant 80s synthwave aesthetic with neon magenta and cyan glows, and subtle scan lines.' },
-    { name: 'Anime', prompt: 'Give the image a vibrant Japanese anime style, with bold outlines, cel-shading, and saturated colors.' },
-    { name: 'Lomo', prompt: 'Apply a Lomography-style cross-processing film effect with high-contrast, oversaturated colors, and dark vignetting.' },
-    { name: 'Glitch', prompt: 'Transform the image into a futuristic holographic projection with digital glitch effects and chromatic aberration.' },
-  ];
+  const activePrompt = selectedPreset || customPrompt;
+  const handlePresetClick = (prompt) => { setSelectedPreset(prompt); setCustomPrompt(''); };
+  const handleCustomChange = (e) => { setCustomPrompt(e.target.value); setSelectedPreset(null); };
+  const handleApply = () => activePrompt && onApply(activePrompt);
   
-  const activePrompt = selectedPresetPrompt || customPrompt;
-  const handlePresetClick = (prompt) => { setSelectedPresetPrompt(prompt); setCustomPrompt(''); };
-  const handleCustomChange = (e) => { setCustomPrompt(e.target.value); setSelectedPresetPrompt(null); };
-  const handleApply = () => activePrompt && onApplyFilter(activePrompt);
-
   return (
-    React.createElement('div', { className: "w-full bg-gray-800/50 border border-gray-700 rounded-lg p-4 flex flex-col gap-4 animate-fade-in backdrop-blur-sm" },
-      React.createElement('h3', { className: "text-lg font-semibold text-center text-gray-300" }, "Apply a Filter"),
-      React.createElement('div', { className: "grid grid-cols-2 md:grid-cols-4 gap-2" },
-        presets.map(preset => React.createElement('button', { key: preset.name, onClick: () => handlePresetClick(preset.prompt), disabled: isLoading, className: `w-full text-center bg-white/10 border border-transparent text-gray-200 font-semibold py-3 px-4 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/20 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed ${selectedPresetPrompt === preset.prompt ? 'ring-2 ring-offset-2 ring-offset-gray-800 ring-blue-500' : ''}` }, preset.name))
-      ),
-      React.createElement('input', { type: "text", value: customPrompt, onChange: handleCustomChange, placeholder: "Or describe a custom filter (e.g., '80s synthwave glow')", className: "flex-grow bg-gray-800 border border-gray-600 text-gray-200 rounded-lg p-4 focus:ring-2 focus:ring-blue-500 focus:outline-none transition w-full disabled:cursor-not-allowed disabled:opacity-60 text-base", disabled: isLoading }),
-      activePrompt && React.createElement('div', { className: "animate-fade-in flex flex-col gap-4 pt-2" },
-        React.createElement('button', { onClick: handleApply, className: "w-full bg-gradient-to-br from-blue-600 to-blue-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-blue-500/20 hover:shadow-xl hover:shadow-blue-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-blue-800 disabled:to-blue-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none", disabled: isLoading || !activePrompt.trim() }, "Apply Filter")
-      )
-    )
+    <div className="w-full bg-gray-800/50 border border-gray-700 rounded-lg p-4 flex flex-col gap-4 animate-fade-in backdrop-blur-sm">
+      <h3 className="text-lg font-semibold text-center text-gray-300">{title}</h3>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {presets.map(({ name, prompt }) => (
+          <button key={name} onClick={() => handlePresetClick(prompt)} disabled={isLoading} className={`w-full text-center bg-white/10 border border-transparent text-gray-200 font-semibold py-3 px-4 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/20 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed ${selectedPreset === prompt ? 'ring-2 ring-offset-2 ring-offset-gray-800 ring-blue-500' : ''}`}>
+            {name}
+          </button>
+        ))}
+      </div>
+      <input type="text" value={customPrompt} onChange={handleCustomChange} placeholder={inputPlaceholder} className="flex-grow bg-gray-800 border border-gray-600 text-gray-200 rounded-lg p-4 focus:ring-2 focus:ring-blue-500 focus:outline-none transition w-full disabled:cursor-not-allowed disabled:opacity-60 text-base" disabled={isLoading} />
+      {activePrompt && (
+        <div className="animate-fade-in flex flex-col gap-4 pt-2">
+          <button onClick={handleApply} className="w-full bg-gradient-to-br from-blue-600 to-blue-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-blue-500/20 hover:shadow-xl hover:shadow-blue-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-blue-800 disabled:to-blue-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none" disabled={isLoading || !activePrompt.trim()}>
+            {buttonText}
+          </button>
+        </div>
+      )}
+    </div>
   );
 };
 
-// --- START components/AdjustmentPanel.jsx ---
-const AdjustmentPanel = ({ onApplyAdjustment, isLoading }) => {
-  const [selectedPresetPrompt, setSelectedPresetPrompt] = useState(null);
-  const [customPrompt, setCustomPrompt] = useState('');
+const FilterPanel = ({ onApplyFilter, isLoading }) => <Panel title="Apply a Filter" presets={[{ name: 'Synthwave', prompt: 'Apply a vibrant 80s synthwave aesthetic with neon magenta and cyan glows, and subtle scan lines.' },{ name: 'Anime', prompt: 'Give the image a vibrant Japanese anime style, with bold outlines, cel-shading, and saturated colors.' },{ name: 'Lomo', prompt: 'Apply a Lomography-style cross-processing film effect with high-contrast, oversaturated colors, and dark vignetting.' },{ name: 'Glitch', prompt: 'Transform the image into a futuristic holographic projection with digital glitch effects and chromatic aberration.' }]} onApply={onApplyFilter} isLoading={isLoading} inputPlaceholder="Or describe a custom filter (e.g., '80s synthwave glow')" buttonText="Apply Filter" />;
+const AdjustmentPanel = ({ onApplyAdjustment, isLoading }) => <Panel title="Apply a Professional Adjustment" presets={[{ name: 'Blur Background', prompt: 'Apply a realistic depth-of-field effect, making the background blurry while keeping the main subject in sharp focus.' },{ name: 'Enhance Details', prompt: 'Slightly enhance the sharpness and details of the image without making it look unnatural.' },{ name: 'Warmer Lighting', prompt: 'Adjust the color temperature to give the image warmer, golden-hour style lighting.' },{ name: 'Studio Light', prompt: 'Add dramatic, professional studio lighting to the main subject.' }]} onApply={onApplyAdjustment} isLoading={isLoading} inputPlaceholder="Or describe an adjustment (e.g., 'change background to a forest')" buttonText="Apply Adjustment" />;
 
-  const presets = [
-    { name: 'Blur Background', prompt: 'Apply a realistic depth-of-field effect, making the background blurry while keeping the main subject in sharp focus.' },
-    { name: 'Enhance Details', prompt: 'Slightly enhance the sharpness and details of the image without making it look unnatural.' },
-    { name: 'Warmer Lighting', prompt: 'Adjust the color temperature to give the image warmer, golden-hour style lighting.' },
-    { name: 'Studio Light', prompt: 'Add dramatic, professional studio lighting to the main subject.' },
-  ];
-
-  const activePrompt = selectedPresetPrompt || customPrompt;
-  const handlePresetClick = (prompt) => { setSelectedPresetPrompt(prompt); setCustomPrompt(''); };
-  const handleCustomChange = (e) => { setCustomPrompt(e.target.value); setSelectedPresetPrompt(null); };
-  const handleApply = () => activePrompt && onApplyAdjustment(activePrompt);
-
-  return (
-    React.createElement('div', { className: "w-full bg-gray-800/50 border border-gray-700 rounded-lg p-4 flex flex-col gap-4 animate-fade-in backdrop-blur-sm" },
-      React.createElement('h3', { className: "text-lg font-semibold text-center text-gray-300" }, "Apply a Professional Adjustment"),
-      React.createElement('div', { className: "grid grid-cols-2 md:grid-cols-4 gap-2" },
-        presets.map(preset => React.createElement('button', { key: preset.name, onClick: () => handlePresetClick(preset.prompt), disabled: isLoading, className: `w-full text-center bg-white/10 border border-transparent text-gray-200 font-semibold py-3 px-4 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/20 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed ${selectedPresetPrompt === preset.prompt ? 'ring-2 ring-offset-2 ring-offset-gray-800 ring-blue-500' : ''}` }, preset.name))
-      ),
-      React.createElement('input', { type: "text", value: customPrompt, onChange: handleCustomChange, placeholder: "Or describe an adjustment (e.g., 'change background to a forest')", className: "flex-grow bg-gray-800 border border-gray-600 text-gray-200 rounded-lg p-4 focus:ring-2 focus:ring-blue-500 focus:outline-none transition w-full disabled:cursor-not-allowed disabled:opacity-60 text-base", disabled: isLoading }),
-      activePrompt && React.createElement('div', { className: "animate-fade-in flex flex-col gap-4 pt-2" },
-        React.createElement('button', { onClick: handleApply, className: "w-full bg-gradient-to-br from-blue-600 to-blue-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-blue-500/20 hover:shadow-xl hover:shadow-blue-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-blue-800 disabled:to-blue-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none", disabled: isLoading || !activePrompt.trim() }, "Apply Adjustment")
-      )
-    )
-  );
-};
-
-// --- START components/CropPanel.jsx ---
 const CropPanel = ({ onApplyCrop, onSetAspect, isLoading, isCropping }) => {
   const [activeAspect, setActiveAspect] = useState('free');
-  const handleAspectChange = (aspect, value) => { setActiveAspect(aspect); onSetAspect(value); }
-  const aspects = [ { name: 'free', value: undefined }, { name: '1:1', value: 1 / 1 }, { name: '16:9', value: 16 / 9 } ];
-
+  const aspects = [{ name: 'free', value: undefined }, { name: '1:1', value: 1 / 1 }, { name: '16:9', value: 16 / 9 }];
+  const handleAspectChange = (name, value) => { setActiveAspect(name); onSetAspect(value); };
   return (
-    React.createElement('div', { className: "w-full bg-gray-800/50 border border-gray-700 rounded-lg p-4 flex flex-col items-center gap-4 animate-fade-in backdrop-blur-sm" },
-      React.createElement('h3', { className: "text-lg font-semibold text-gray-300" }, "Crop Image"),
-      React.createElement('p', { className: "text-sm text-gray-400 -mt-2" }, "Click and drag on the image to select a crop area."),
-      React.createElement('div', { className: "flex items-center gap-2" },
-        React.createElement('span', { className: "text-sm font-medium text-gray-400" }, "Aspect Ratio:"),
-        aspects.map(({ name, value }) => React.createElement('button', { key: name, onClick: () => handleAspectChange(name, value), disabled: isLoading, className: `px-4 py-2 rounded-md text-base font-semibold transition-all duration-200 active:scale-95 disabled:opacity-50 ${ activeAspect === name ? 'bg-gradient-to-br from-blue-600 to-blue-500 text-white shadow-md shadow-blue-500/20' : 'bg-white/10 hover:bg-white/20 text-gray-200'}` }, name))
-      ),
-      React.createElement('button', { onClick: onApplyCrop, disabled: isLoading || !isCropping, className: "w-full max-w-xs mt-2 bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-green-800 disabled:to-green-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none" }, "Apply Crop")
-    )
+    <div className="w-full bg-gray-800/50 border border-gray-700 rounded-lg p-4 flex flex-col items-center gap-4 animate-fade-in backdrop-blur-sm">
+      <h3 className="text-lg font-semibold text-gray-300">Crop Image</h3>
+      <p className="text-sm text-gray-400 -mt-2">Click and drag on the image to select a crop area.</p>
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-gray-400">Aspect Ratio:</span>
+        {aspects.map(({ name, value }) => <button key={name} onClick={() => handleAspectChange(name, value)} disabled={isLoading} className={`px-4 py-2 rounded-md text-base font-semibold transition-all duration-200 active:scale-95 disabled:opacity-50 ${ activeAspect === name ? 'bg-gradient-to-br from-blue-600 to-blue-500 text-white shadow-md shadow-blue-500/20' : 'bg-white/10 hover:bg-white/20 text-gray-200'}`}>{name}</button>)}
+      </div>
+      <button onClick={onApplyCrop} disabled={isLoading || !isCropping} className="w-full max-w-xs mt-2 bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-4 px-6 rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base disabled:from-green-800 disabled:to-green-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none">Apply Crop</button>
+    </div>
   );
 };
 
-// --- START App.jsx ---
+// --- Main App Component ---
 const dataURLtoFile = (dataurl, filename) => {
-    const arr = dataurl.split(','), mimeMatch = arr[0].match(/:(.*?);/);
+    const [header, data] = dataurl.split(',');
+    const mimeMatch = header.match(/:(.*?);/);
     if (!mimeMatch) throw new Error("Could not parse MIME type");
-    const mime = mimeMatch[1], bstr = atob(arr[1]);
+    const mime = mimeMatch[1];
+    const bstr = atob(data);
     let n = bstr.length;
     const u8arr = new Uint8Array(n);
     while(n--) u8arr[n] = bstr.charCodeAt(n);
@@ -501,24 +423,22 @@ const App = () => {
 
   const currentImage = history[historyIndex] ?? null;
   const originalImage = history[0] ?? null;
-  const [currentImageUrl, setCurrentImageUrl] = useState(null);
-  const [originalImageUrl, setOriginalImageUrl] = useState(null);
 
-  useEffect(() => {
-    if (currentImage) {
-      const url = URL.createObjectURL(currentImage);
-      setCurrentImageUrl(url);
-      return () => URL.revokeObjectURL(url);
-    } else { setCurrentImageUrl(null); }
-  }, [currentImage]);
+  const useObjectUrl = (file) => {
+    const [url, setUrl] = useState(null);
+    useEffect(() => {
+        if (file) {
+            const newUrl = URL.createObjectURL(file);
+            setUrl(newUrl);
+            return () => URL.revokeObjectURL(newUrl);
+        }
+        setUrl(null);
+    }, [file]);
+    return url;
+  };
   
-  useEffect(() => {
-    if (originalImage) {
-      const url = URL.createObjectURL(originalImage);
-      setOriginalImageUrl(url);
-      return () => URL.revokeObjectURL(url);
-    } else { setOriginalImageUrl(null); }
-  }, [originalImage]);
+  const currentImageUrl = useObjectUrl(currentImage);
+  const originalImageUrl = useObjectUrl(originalImage);
 
   const canUndo = historyIndex > 0;
   const canRedo = historyIndex < history.length - 1;
@@ -528,8 +448,7 @@ const App = () => {
     newHistory.push(newImageFile);
     setHistory(newHistory);
     setHistoryIndex(newHistory.length - 1);
-    setCrop(undefined);
-    setCompletedCrop(undefined);
+    setCrop(undefined); setCompletedCrop(undefined);
   }, [history, historyIndex]);
 
   const handleImageUpload = useCallback((file) => {
@@ -538,155 +457,145 @@ const App = () => {
     setHistoryIndex(0);
   }, []);
 
-  const handleApiError = (err, context) => {
-    const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-    console.error(err);
-    const lowerCaseError = errorMessage.toLowerCase();
-    if (lowerCaseError.includes('api key not valid') || lowerCaseError.includes('permission denied') || lowerCaseError.includes('quota')) {
-        setError(`Failed to ${context}. The API call was rejected by Google. This is almost always due to API key restrictions (like domain/IP limits) or billing issues, not a problem with the app's code. Please check your Google AI/Cloud console. Original Error: ${errorMessage}`);
-    } else {
-        setError(`Failed to ${context}. Please check your network connection. Error: ${errorMessage}`);
+  const handleApiCall = useCallback(async (apiFunction, ...args) => {
+    setIsLoading(true); setError(null);
+    try {
+        const imageUrl = await apiFunction(...args);
+        addImageToHistory(dataURLtoFile(imageUrl, `edited-${Date.now()}.png`));
+        return true;
+    } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
+        console.error(err);
+        setError(`API Error: ${errorMessage}`);
+        return false;
+    } finally {
+        setIsLoading(false);
     }
-  };
+  }, [addImageToHistory]);
 
-  const handleGenerate = useCallback(async () => {
-    if (!currentImage || !prompt.trim() || !editHotspot) {
-      setError(!currentImage ? 'No image loaded.' : !editHotspot ? 'Please click on the image to select an area.' : 'Please enter a description.');
-      return;
-    }
-    setIsLoading(true); setError(null);
-    try {
-        const editedImageUrl = await generateEditedImage(currentImage, prompt, editHotspot);
-        addImageToHistory(dataURLtoFile(editedImageUrl, `edited-${Date.now()}.png`));
-        setEditHotspot(null); setDisplayHotspot(null);
-    } catch (err) { handleApiError(err, 'generate the image'); } 
-    finally { setIsLoading(false); }
-  }, [currentImage, prompt, editHotspot, addImageToHistory]);
-  
-  const handleApplyFilter = useCallback(async (filterPrompt) => {
-    if (!currentImage) return;
-    setIsLoading(true); setError(null);
-    try {
-        const filteredImageUrl = await generateFilteredImage(currentImage, filterPrompt);
-        addImageToHistory(dataURLtoFile(filteredImageUrl, `filtered-${Date.now()}.png`));
-    } catch (err) { handleApiError(err, 'apply the filter'); } 
-    finally { setIsLoading(false); }
-  }, [currentImage, addImageToHistory]);
-  
-  const handleApplyAdjustment = useCallback(async (adjustmentPrompt) => {
-    if (!currentImage) return;
-    setIsLoading(true); setError(null);
-    try {
-        const adjustedImageUrl = await generateAdjustedImage(currentImage, adjustmentPrompt);
-        addImageToHistory(dataURLtoFile(adjustedImageUrl, `adjusted-${Date.now()}.png`));
-    } catch (err) { handleApiError(err, 'apply the adjustment'); } 
-    finally { setIsLoading(false); }
-  }, [currentImage, addImageToHistory]);
+  const handleGenerate = () => {
+    if (!prompt.trim() || !editHotspot) return;
+    handleApiCall(generateEditedImage, currentImage, prompt, editHotspot).then(success => {
+        if(success) { setEditHotspot(null); setDisplayHotspot(null); }
+    });
+  };
+  const handleApplyFilter = (filterPrompt) => handleApiCall(generateFilteredImage, currentImage, filterPrompt);
+  const handleApplyAdjustment = (adjustmentPrompt) => handleApiCall(generateAdjustedImage, currentImage, adjustmentPrompt);
 
   const handleApplyCrop = useCallback(() => {
     if (!completedCrop || !imgRef.current) return;
     const image = imgRef.current;
     const canvas = document.createElement('canvas');
     const scaleX = image.naturalWidth / image.width, scaleY = image.naturalHeight / image.height;
-    canvas.width = completedCrop.width; canvas.height = completedCrop.height;
+    canvas.width = completedCrop.width * scaleX; canvas.height = completedCrop.height * scaleY;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.drawImage(image, completedCrop.x * scaleX, completedCrop.y * scaleY, completedCrop.width * scaleX, completedCrop.height * scaleY, 0, 0, completedCrop.width, completedCrop.height);
+    ctx.drawImage(image, completedCrop.x * scaleX, completedCrop.y * scaleY, completedCrop.width * scaleX, completedCrop.height * scaleY, 0, 0, canvas.width, canvas.height);
     addImageToHistory(dataURLtoFile(canvas.toDataURL('image/png'), `cropped-${Date.now()}.png`));
   }, [completedCrop, addImageToHistory]);
 
-  const handleUndo = useCallback(() => canUndo && setHistoryIndex(historyIndex - 1), [canUndo, historyIndex]);
-  const handleRedo = useCallback(() => canRedo && setHistoryIndex(historyIndex + 1), [canRedo, historyIndex]);
-  const handleReset = useCallback(() => history.length > 0 && setHistoryIndex(0), [history]);
-  const handleUploadNew = useCallback(() => { setHistory([]); setHistoryIndex(-1); }, []);
-  const handleDownload = useCallback(() => {
-      if (currentImage) {
+  const handleUndo = () => canUndo && setHistoryIndex(historyIndex - 1);
+  const handleRedo = () => canRedo && setHistoryIndex(historyIndex + 1);
+  const handleReset = () => history.length > 0 && setHistoryIndex(0);
+  const handleUploadNew = () => { setHistory([]); setHistoryIndex(-1); };
+  const handleDownload = () => {
+      if (currentImageUrl) {
           const link = document.createElement('a');
-          link.href = URL.createObjectURL(currentImage);
-          link.download = `edited-${currentImage.name}`;
-          document.body.appendChild(link);
+          link.href = currentImageUrl;
+          link.download = `pixshop-edited-${currentImage.name}`;
           link.click();
-          document.body.removeChild(link);
-          URL.revokeObjectURL(link.href);
       }
-  }, [currentImage]);
+  };
   
-  const handleFileSelect = (files) => files && files[0] && handleImageUpload(files[0]);
+  const handleFileSelect = (files) => files?.[0] && handleImageUpload(files[0]);
   const handleImageClick = (e) => {
-    if (activeTab !== 'retouch') return;
-    const img = e.currentTarget, rect = img.getBoundingClientRect();
+    if (activeTab !== 'retouch' || !imgRef.current) return;
+    const img = imgRef.current, rect = img.getBoundingClientRect();
     const offsetX = e.clientX - rect.left, offsetY = e.clientY - rect.top;
     setDisplayHotspot({ x: offsetX, y: offsetY });
     const { naturalWidth, naturalHeight, clientWidth, clientHeight } = img;
     const scaleX = naturalWidth / clientWidth, scaleY = naturalHeight / clientHeight;
     setEditHotspot({ x: Math.round(offsetX * scaleX), y: Math.round(offsetY * scaleY) });
   };
-
-  const renderContent = () => {
-    if (!currentImageUrl) return React.createElement(StartScreen, { onFileSelect: handleFileSelect });
-
-    const imageDisplay = React.createElement('div', { className: "relative" },
-        originalImageUrl && React.createElement('img', { key: originalImageUrl, src: originalImageUrl, alt: "Original", className: "w-full h-auto object-contain max-h-[60vh] rounded-xl pointer-events-none" }),
-        React.createElement('img', { ref: imgRef, key: currentImageUrl, src: currentImageUrl, alt: "Current", onClick: handleImageClick, className: `absolute top-0 left-0 w-full h-auto object-contain max-h-[60vh] rounded-xl transition-opacity duration-200 ease-in-out ${isComparing ? 'opacity-0' : 'opacity-100'} ${activeTab === 'retouch' ? 'cursor-crosshair' : ''}` })
-    );
-    
-    const cropImageElement = React.createElement('img', { ref: imgRef, key: `crop-${currentImageUrl}`, src: currentImageUrl, alt: "Crop this image", className: "w-full h-auto object-contain max-h-[60vh] rounded-xl" });
-
-    return React.createElement('div', { className: "w-full max-w-4xl mx-auto flex flex-col items-center gap-6 animate-fade-in" },
-      React.createElement('div', { className: "relative w-full shadow-2xl rounded-xl overflow-hidden bg-black/20" },
-        isLoading && React.createElement('div', { className: "absolute inset-0 bg-black/70 z-30 flex flex-col items-center justify-center gap-4 animate-fade-in" }, React.createElement(Spinner), React.createElement('p', { className: "text-gray-300" }, "AI is working...")),
-        activeTab === 'crop' ? React.createElement(ReactCrop, { crop: crop, onChange: setCrop, onComplete: setCompletedCrop, aspect: aspect, className: "max-h-[60vh]" }, cropImageElement) : imageDisplay,
-        displayHotspot && !isLoading && activeTab === 'retouch' && React.createElement('div', { className: "absolute rounded-full w-6 h-6 bg-blue-500/50 border-2 border-white pointer-events-none -translate-x-1/2 -translate-y-1/2 z-10", style: { left: `${displayHotspot.x}px`, top: `${displayHotspot.y}px` }}, React.createElement('div', { className: "absolute inset-0 rounded-full w-6 h-6 animate-ping bg-blue-400" }))
-      ),
-      React.createElement('div', { className: "w-full bg-gray-800/80 border border-gray-700/80 rounded-lg p-2 flex items-center justify-center gap-2 backdrop-blur-sm" },
-        (['retouch', 'crop', 'adjust', 'filters']).map(tab => React.createElement('button', { key: tab, onClick: () => setActiveTab(tab), className: `w-full capitalize font-semibold py-3 px-5 rounded-md transition-all duration-200 text-base ${ activeTab === tab ? 'bg-gradient-to-br from-blue-500 to-cyan-400 text-white shadow-lg shadow-cyan-500/40' : 'text-gray-300 hover:text-white hover:bg-white/10'}`}, tab))
-      ),
-      React.createElement('div', { className: "w-full" },
-        activeTab === 'retouch' && React.createElement('div', { className: "flex flex-col items-center gap-4" },
-          React.createElement('p', { className: "text-md text-gray-400" }, editHotspot ? 'Great! Now describe your localized edit below.' : 'Click an area on the image to make a precise edit.'),
-          React.createElement('form', { onSubmit: (e) => { e.preventDefault(); handleGenerate(); }, className: "w-full flex items-center gap-2" },
-            React.createElement('input', { type: "text", value: prompt, onChange: (e) => setPrompt(e.target.value), placeholder: editHotspot ? "e.g., 'change my shirt color to blue'" : "First click a point on the image", className: "flex-grow bg-gray-800 border border-gray-700 text-gray-200 rounded-lg p-5 text-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition w-full disabled:cursor-not-allowed disabled:opacity-60", disabled: isLoading || !editHotspot }),
-            React.createElement('button', { type: "submit", className: "bg-gradient-to-br from-blue-600 to-blue-500 text-white font-bold py-5 px-8 text-lg rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-blue-500/20 hover:shadow-xl hover:shadow-blue-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner disabled:from-blue-800 disabled:to-blue-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none", disabled: isLoading || !prompt.trim() || !editHotspot }, "Generate")
-          )
-        ),
-        activeTab === 'crop' && React.createElement(CropPanel, { onApplyCrop: handleApplyCrop, onSetAspect: setAspect, isLoading: isLoading, isCropping: !!completedCrop?.width && completedCrop.width > 0 }),
-        activeTab === 'adjust' && React.createElement(AdjustmentPanel, { onApplyAdjustment: handleApplyAdjustment, isLoading: isLoading }),
-        activeTab === 'filters' && React.createElement(FilterPanel, { onApplyFilter: handleApplyFilter, isLoading: isLoading })
-      ),
-      React.createElement('div', { className: "flex flex-wrap items-center justify-center gap-3 mt-6" },
-        React.createElement('button', { onClick: handleUndo, disabled: !canUndo, className: "flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-white/5" }, React.createElement(UndoIcon, { className: "w-5 h-5 mr-2" }), "Undo"),
-        React.createElement('button', { onClick: handleRedo, disabled: !canRedo, className: "flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-white/5" }, React.createElement(RedoIcon, { className: "w-5 h-5 mr-2" }), "Redo"),
-        React.createElement('div', { className: "h-6 w-px bg-gray-600 mx-1 hidden sm:block" }),
-        canUndo && React.createElement('button', { onMouseDown: () => setIsComparing(true), onMouseUp: () => setIsComparing(false), onMouseLeave: () => setIsComparing(false), onTouchStart: () => setIsComparing(true), onTouchEnd: () => setIsComparing(false), className: "flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base" }, React.createElement(EyeIcon, { className: "w-5 h-5 mr-2" }), "Compare"),
-        React.createElement('button', { onClick: handleReset, disabled: !canUndo, className: "text-center bg-transparent border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/10 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-transparent" }, "Reset"),
-        React.createElement('button', { onClick: handleUploadNew, className: "text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base" }, "Upload New"),
-        React.createElement('button', { onClick: handleDownload, className: "flex-grow sm:flex-grow-0 ml-auto bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-3 px-5 rounded-md transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base" }, "Download Image")
-      )
-    );
-  };
   
-  const renderMainContent = () => {
-    if (error) {
-      return React.createElement('div', { className: "text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4" },
-        React.createElement('h2', { className: "text-2xl font-bold text-red-300" }, "An Error Occurred"),
-        React.createElement('p', { className: "text-md text-red-400 whitespace-pre-wrap" }, error),
-        React.createElement('button', { onClick: () => setError(null), className: "bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors" }, "Try Again")
-      );
-    }
-    return renderContent();
-  }
-  
-  return React.createElement('div', { className: "min-h-screen text-gray-100 flex flex-col" },
-    React.createElement(Header),
-    React.createElement('main', { className: `flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center ${currentImage ? 'items-start' : 'items-center'}` },
-      renderMainContent()
-    )
+  if (!currentImage) return <main className="flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center items-center"><StartScreen onFileSelect={handleFileSelect} /></main>;
+
+  return (
+    <div className="min-h-screen text-gray-100 flex flex-col">
+      <Header />
+      <main className="flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center items-start">
+        <div className="w-full max-w-4xl mx-auto flex flex-col items-center gap-6 animate-fade-in">
+          <div className="relative w-full shadow-2xl rounded-xl overflow-hidden bg-black/20">
+            {isLoading && (
+                <div className="absolute inset-0 bg-black/70 z-30 flex flex-col items-center justify-center gap-4 animate-fade-in">
+                    <Spinner />
+                    <p className="text-gray-300">AI is working...</p>
+                </div>
+            )}
+            {activeTab === 'crop' ? (
+                <ReactCrop crop={crop} onChange={(c, pc) => setCrop(c)} onComplete={(c) => setCompletedCrop(c)} aspect={aspect} className="max-h-[60vh]">
+                    <img ref={imgRef} src={currentImageUrl} alt="Crop this image" className="w-full h-auto object-contain max-h-[60vh] rounded-xl" />
+                </ReactCrop>
+            ) : (
+                <div className="relative" onClick={handleImageClick}>
+                    {originalImageUrl && <img src={originalImageUrl} alt="Original" className="w-full h-auto object-contain max-h-[60vh] rounded-xl pointer-events-none" />}
+                    <img ref={imgRef} src={currentImageUrl} alt="Current" className={`absolute top-0 left-0 w-full h-auto object-contain max-h-[60vh] rounded-xl transition-opacity duration-200 ease-in-out ${isComparing ? 'opacity-0' : 'opacity-100'} ${activeTab === 'retouch' ? 'cursor-crosshair' : ''}`} />
+                </div>
+            )}
+            {displayHotspot && !isLoading && activeTab === 'retouch' && (
+                <div className="absolute rounded-full w-6 h-6 bg-blue-500/50 border-2 border-white pointer-events-none -translate-x-1/2 -translate-y-1/2 z-10" style={{ left: `${displayHotspot.x}px`, top: `${displayHotspot.y}px` }}>
+                    <div className="absolute inset-0 rounded-full w-6 h-6 animate-ping bg-blue-400"></div>
+                </div>
+            )}
+          </div>
+          
+          {error && (
+            <div className="w-full text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-4 rounded-lg flex items-center justify-between gap-4">
+              <p className="text-md text-red-300 text-left whitespace-pre-wrap">{error}</p>
+              <button onClick={() => setError(null)} className="bg-red-500/20 hover:bg-red-500/40 text-white font-bold py-2 px-4 rounded-lg text-sm transition-colors">Dismiss</button>
+            </div>
+          )}
+
+          <div className="w-full bg-gray-800/80 border border-gray-700/80 rounded-lg p-2 flex items-center justify-center gap-2 backdrop-blur-sm">
+            {['retouch', 'crop', 'adjust', 'filters'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} className={`w-full capitalize font-semibold py-3 px-5 rounded-md transition-all duration-200 text-base ${ activeTab === tab ? 'bg-gradient-to-br from-blue-500 to-cyan-400 text-white shadow-lg shadow-cyan-500/40' : 'text-gray-300 hover:text-white hover:bg-white/10'}`}>
+                {tab}
+              </button>
+            ))}
+          </div>
+
+          <div className="w-full">
+            {activeTab === 'retouch' && (
+              <div className="flex flex-col items-center gap-4">
+                <p className="text-md text-gray-400">{editHotspot ? 'Great! Now describe your localized edit below.' : 'Click an area on the image to make a precise edit.'}</p>
+                <form onSubmit={(e) => { e.preventDefault(); handleGenerate(); }} className="w-full flex items-center gap-2">
+                  <input type="text" value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={editHotspot ? "e.g., 'change my shirt color to blue'" : "First click a point on the image"} className="flex-grow bg-gray-800 border border-gray-700 text-gray-200 rounded-lg p-5 text-lg focus:ring-2 focus:ring-blue-500 focus:outline-none transition w-full disabled:cursor-not-allowed disabled:opacity-60" disabled={isLoading || !editHotspot} />
+                  <button type="submit" className="bg-gradient-to-br from-blue-600 to-blue-500 text-white font-bold py-5 px-8 text-lg rounded-lg transition-all duration-300 ease-in-out shadow-lg shadow-blue-500/20 hover:shadow-xl hover:shadow-blue-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner disabled:from-blue-800 disabled:to-blue-700 disabled:shadow-none disabled:cursor-not-allowed disabled:transform-none" disabled={isLoading || !prompt.trim() || !editHotspot}>Generate</button>
+                </form>
+              </div>
+            )}
+            {activeTab === 'crop' && <CropPanel onApplyCrop={handleApplyCrop} onSetAspect={setAspect} isLoading={isLoading} isCropping={!!completedCrop?.width && completedCrop.width > 0} />}
+            {activeTab === 'adjust' && <AdjustmentPanel onApplyAdjustment={handleApplyAdjustment} isLoading={isLoading} />}
+            {activeTab === 'filters' && <FilterPanel onApplyFilter={handleApplyFilter} isLoading={isLoading} />}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-center gap-3 mt-6">
+            <button onClick={handleUndo} disabled={!canUndo} className="flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-white/5"><UndoIcon className="w-5 h-5 mr-2" />Undo</button>
+            <button onClick={handleRedo} disabled={!canRedo} className="flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-white/5"><RedoIcon className="w-5 h-5 mr-2" />Redo</button>
+            <div className="h-6 w-px bg-gray-600 mx-1 hidden sm:block" />
+            {canUndo && <button onMouseDown={() => setIsComparing(true)} onMouseUp={() => setIsComparing(false)} onMouseLeave={() => setIsComparing(false)} onTouchStart={() => setIsComparing(true)} onTouchEnd={() => setIsComparing(false)} className="flex items-center justify-center text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base"><EyeIcon className="w-5 h-5 mr-2" />Compare</button>}
+            <button onClick={handleReset} disabled={!canUndo} className="text-center bg-transparent border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/10 hover:border-white/30 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed disabled:bg-transparent">Reset</button>
+            <button onClick={handleUploadNew} className="text-center bg-white/10 border border-white/20 text-gray-200 font-semibold py-3 px-5 rounded-md transition-all duration-200 ease-in-out hover:bg-white/20 hover:border-white/30 active:scale-95 text-base">Upload New</button>
+            <button onClick={handleDownload} className="flex-grow sm:flex-grow-0 ml-auto bg-gradient-to-br from-green-600 to-green-500 text-white font-bold py-3 px-5 rounded-md transition-all duration-300 ease-in-out shadow-lg shadow-green-500/20 hover:shadow-xl hover:shadow-green-500/40 hover:-translate-y-px active:scale-95 active:shadow-inner text-base">Download Image</button>
+          </div>
+        </div>
+      </main>
+    </div>
   );
 };
 
-const rootElement = document.getElementById('root');
-const root = ReactDOM.createRoot(rootElement);
-root.render(React.createElement(React.StrictMode, null, React.createElement(App)));
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<React.StrictMode><App /></React.StrictMode>);
 
     </script>
   </body>
