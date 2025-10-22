@@ -464,9 +464,20 @@ const App = () => {
         addImageToHistory(dataURLtoFile(imageUrl, `edited-${Date.now()}.png`));
         return true;
     } catch (err) {
-        const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-        console.error(err);
-        setError(`API Error: ${errorMessage}`);
+        console.error("Full API Error:", err);
+        let detailedMessage = "An unknown error occurred. See the browser console for more details.";
+        if (err instanceof Error) {
+            detailedMessage = err.message;
+
+            if (detailedMessage.toLowerCase().includes("api key not valid")) {
+                detailedMessage = "API Key Not Valid.\n\nPlease make sure the key in the code is correct.";
+            } else if (detailedMessage.toLowerCase().includes("permission denied") || detailedMessage.toLowerCase().includes("forbidden")) {
+                detailedMessage = "Permission Denied.\n\nThis is the most common error when deploying.\nSOLUTION: Your API key is likely restricted. Go to Google Cloud Console -> 'APIs & Services' -> 'Credentials'. Find your key and under 'Application restrictions', select 'None'.";
+            } else if (detailedMessage.toLowerCase().includes("quota") || detailedMessage.toLowerCase().includes("resource has been exhausted")) {
+                detailedMessage = "Quota Exceeded.\n\nYou have exceeded the free tier limit for the Gemini API. Please check your usage in the Google Cloud console or add a billing method.";
+            }
+        }
+        setError(`API Call Failed:\n${detailedMessage}`);
         return false;
     } finally {
         setIsLoading(false);
