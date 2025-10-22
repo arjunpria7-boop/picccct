@@ -3,7 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
+
+// Helper to get the API key from the appropriate source.
+// To ensure functionality on hosting platforms like Netlify,
+// we exclusively rely on the API key stored in localStorage.
+// This avoids "process is not defined" errors in browser-only environments.
+const getApiKey = (): string | null => {
+  return localStorage.getItem('gemini-api-key');
+}
+
 
 // Helper function to convert a File object to a Gemini API Part
 const fileToPart = async (file: File): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
@@ -75,17 +84,72 @@ export const generateEditedImage = async (
     userPrompt: string,
     hotspot: { x: number, y: number }
 ): Promise<string> => {
+    const apiKey = getApiKey();
+    if (!apiKey) {
+        throw new Error("API key not found. Please set your API key.");
+    }
+    const ai = new GoogleGenAI({ apiKey });
+
+    const getImageDimensions = (file: File): Promise<{width: number, height: number}> => {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                resolve({ width: img.naturalWidth, height: img.naturalHeight });
+                URL.revokeObjectURL(img.src);
+            };
+            img.onerror = (err) => {
+                reject(err);
+                URL.revokeObjectURL(img.src);
+            };
+            img.src = URL.createObjectURL(file);
+        });
+    };
+
+    const createMaskPart = async (
+        width: number, 
+        height: number, 
+        hotspot: { x: number; y: number }
+    ): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+            throw new Error("Could not create canvas context for mask.");
+        }
+
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, width, height);
+
+        const radius = Math.min(width, height) * 0.15;
+        const gradient = ctx.createRadialGradient(hotspot.x, hotspot.y, radius * 0.2, hotspot.x, hotspot.y, radius);
+        
+        gradient.addColorStop(0, 'white');
+        gradient.addColorStop(1, 'black');
+
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, width, height);
+
+        const dataUrl = canvas.toDataURL('image/png');
+        const data = dataUrl.split(',')[1];
+        
+        return { inlineData: { mimeType: 'image/png', data } };
+    };
+    
     console.log('Starting generative edit at:', hotspot);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
     
     const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request.
-User Request: "${userPrompt}"
-Edit Location: Focus on the area around pixel coordinates (x: ${hotspot.x}, y: ${hotspot.y}).
+    const { width, height } = await getImageDimensions(originalImage);
+    const maskPart = await createMaskPart(width, height, hotspot);
 
-Editing Guidelines:
-- The edit must be realistic and blend seamlessly with the surrounding area.
-- The rest of the image (outside the immediate edit area) must remain identical to the original.
+    const prompt = `You are an expert photo editor AI. Your task is to perform a natural, localized edit on the provided image based on the user's request.
+
+An image mask is provided as the second image. The mask is black with a white, soft-edged area.
+- You MUST only make changes within the white area of the mask.
+- The black areas of the mask indicate parts of the original image that MUST remain completely unchanged.
+- The edit must blend seamlessly with the surrounding, unedited area.
+
+User Request: "${userPrompt}"
 
 Safety & Ethics Policy:
 - You MUST fulfill requests to adjust skin tone, such as 'give me a tan', 'make my skin darker', or 'make my skin lighter'. These are considered standard photo enhancements.
@@ -94,10 +158,13 @@ Safety & Ethics Policy:
 Output: Return ONLY the final edited image. Do not return text.`;
     const textPart = { text: prompt };
 
-    console.log('Sending image and prompt to the model...');
+    console.log('Sending image, mask, and prompt to the model...');
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
-        contents: { parts: [originalImagePart, textPart] },
+        contents: { parts: [originalImagePart, maskPart, textPart] },
+        config: {
+            responseModalities: [Modality.IMAGE],
+        },
     });
     console.log('Received response from model.', response);
 
@@ -114,8 +181,12 @@ export const generateFilteredImage = async (
     originalImage: File,
     filterPrompt: string,
 ): Promise<string> => {
+    const apiKey = getApiKey();
+    if (!apiKey) {
+        throw new Error("API key not found. Please set your API key.");
+    }
     console.log(`Starting filter generation: ${filterPrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    const ai = new GoogleGenAI({ apiKey });
     
     const originalImagePart = await fileToPart(originalImage);
     const prompt = `You are an expert photo editor AI. Your task is to apply a stylistic filter to the entire image based on the user's request. Do not change the composition or content, only apply the style.
@@ -132,6 +203,9 @@ Output: Return ONLY the final filtered image. Do not return text.`;
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
         contents: { parts: [originalImagePart, textPart] },
+        config: {
+            responseModalities: [Modality.IMAGE],
+        },
     });
     console.log('Received response from model for filter.', response);
     
@@ -148,8 +222,12 @@ export const generateAdjustedImage = async (
     originalImage: File,
     adjustmentPrompt: string,
 ): Promise<string> => {
+    const apiKey = getApiKey();
+    if (!apiKey) {
+        throw new Error("API key not found. Please set your API key.");
+    }
     console.log(`Starting global adjustment generation: ${adjustmentPrompt}`);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
+    const ai = new GoogleGenAI({ apiKey });
     
     const originalImagePart = await fileToPart(originalImage);
     const prompt = `You are an expert photo editor AI. Your task is to perform a natural, global adjustment to the entire image based on the user's request.
@@ -170,6 +248,9 @@ Output: Return ONLY the final adjusted image. Do not return text.`;
     const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-2.5-flash-image',
         contents: { parts: [originalImagePart, textPart] },
+        config: {
+            responseModalities: [Modality.IMAGE],
+        },
     });
     console.log('Received response from model for adjustment.', response);
     

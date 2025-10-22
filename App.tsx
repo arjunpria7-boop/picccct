@@ -35,17 +35,16 @@ const dataURLtoFile = (dataurl: string, filename: string): File => {
 
 type Tab = 'retouch' | 'adjust' | 'filters' | 'crop';
 
-// Fix: Define a named interface `AIStudio` and use it for `window.aistudio`.
-// This resolves the TypeScript error about subsequent property declarations needing to have the same type.
-// The AIStudio interface is moved inside `declare global` to make it a global type.
 declare global {
+  // Fix: Moved AIStudio interface inside `declare global` to resolve declaration errors.
+  // This ensures it correctly augments the global Window type without scope conflicts.
   interface AIStudio {
     hasSelectedApiKey: () => Promise<boolean>;
     openSelectKey: () => Promise<void>;
   }
-
   interface Window {
-    aistudio: AIStudio;
+    // Fix: Made `aistudio` optional to match other declarations and reflect that it's only present in specific environments.
+    aistudio?: AIStudio;
   }
 }
 
@@ -70,13 +69,14 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const checkApiKey = async () => {
+      setIsCheckingApiKey(true);
       try {
         if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
           const keyStatus = await window.aistudio.hasSelectedApiKey();
           setHasApiKey(keyStatus);
         } else {
-          console.warn('aistudio API not found. Assuming no key.');
-          setHasApiKey(false);
+          const storedKey = localStorage.getItem('gemini-api-key');
+          setHasApiKey(!!storedKey);
         }
       } catch (e) {
         console.error("Error checking for API key:", e);
@@ -101,6 +101,13 @@ const App: React.FC = () => {
       setError("Could not open the API key selection dialog.");
     }
   }, []);
+
+  const handleSaveKey = useCallback((key: string) => {
+    localStorage.setItem('gemini-api-key', key);
+    setHasApiKey(true);
+    setError(null);
+  }, []);
+
 
   const currentImage = history[historyIndex] ?? null;
   const originalImage = history[0] ?? null;
@@ -154,8 +161,9 @@ const App: React.FC = () => {
 
   const handleApiError = (err: unknown, context: string) => {
     const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-    if (errorMessage.includes("Requested entity was not found.")) {
-        setError("Your API key may be invalid or lack necessary permissions. Please select a valid key and try again.");
+    if (errorMessage.includes("API key not valid") || errorMessage.includes("permission") || errorMessage.includes("not found") || errorMessage.includes("API key not found")) {
+        setError("Your API key may be invalid or lack necessary permissions. Please provide a valid key and try again.");
+        localStorage.removeItem('gemini-api-key');
         setHasApiKey(false);
     } else {
         setError(`Failed to ${context}. ${errorMessage}`);
@@ -519,28 +527,38 @@ const App: React.FC = () => {
     );
   };
   
+  const renderMainContent = () => {
+    if (error) {
+      return (
+        <div className="text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4">
+          <h2 className="text-2xl font-bold text-red-300">An Error Occurred</h2>
+          <p className="text-md text-red-400">{error}</p>
+          <button
+              onClick={() => setError(null)}
+              className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors"
+            >
+              Try Again
+          </button>
+        </div>
+      );
+    }
+    
+    if (isCheckingApiKey) {
+      return <Spinner />;
+    }
+
+    if (hasApiKey) {
+      return renderContent();
+    }
+
+    return <ApiKeyScreen onSelectKey={handleSelectKey} onSaveKey={handleSaveKey} />;
+  }
+  
   return (
     <div className="min-h-screen text-gray-100 flex flex-col">
       <Header />
       <main className={`flex-grow w-full max-w-[1600px] mx-auto p-4 md:p-8 flex justify-center ${hasApiKey && currentImage ? 'items-start' : 'items-center'}`}>
-        {error ? (
-           <div className="text-center animate-fade-in bg-red-500/10 border border-red-500/20 p-8 rounded-lg max-w-2xl mx-auto flex flex-col items-center gap-4">
-            <h2 className="text-2xl font-bold text-red-300">An Error Occurred</h2>
-            <p className="text-md text-red-400">{error}</p>
-            <button
-                onClick={() => setError(null)}
-                className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-6 rounded-lg text-md transition-colors"
-              >
-                Try Again
-            </button>
-          </div>
-        ) : isCheckingApiKey ? (
-          <Spinner />
-        ) : hasApiKey ? (
-          renderContent()
-        ) : (
-          <ApiKeyScreen onSelectKey={handleSelectKey} />
-        )}
+        {renderMainContent()}
       </main>
     </div>
   );
